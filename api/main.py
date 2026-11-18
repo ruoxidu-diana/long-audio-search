@@ -410,7 +410,7 @@ def search(query: str, limit: int = 20):
             filename = (t.filename if t else payload.get("filename", ""))
             tags = (t.tags if t else payload.get("tags", ""))
             desc = (t.description if t else payload.get("description", ""))
-            sim = float(1 - r.score) if getattr(r, "score", None) is not None else 0.0
+            sim = float(r.score) if getattr(r, "score", None) is not None else 0.0
             kw = keyword_bonus(terms, " ".join([filename, tags or "", desc or ""]))
             final = SIM_WEIGHT * sim + KW_WEIGHT * kw
             out.append(
