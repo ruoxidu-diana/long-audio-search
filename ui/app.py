@@ -1,9 +1,12 @@
 import os
+import io
+import wave
 
 os.environ["GRADIO_SERVER_NAME"] = os.getenv("GRADIO_SERVER_NAME", "0.0.0.0")
 os.environ["GRADIO_SERVER_PORT"] = os.getenv("GRADIO_SERVER_PORT", "7860")
 
 import pandas as pd
+import numpy as np
 import requests
 import gradio as gr
 
@@ -120,6 +123,89 @@ def on_pick(selection_label: str, table_rows):
     return html, track_id, row.get("tags", ""), row.get("description", "")
 
 
+# ---- Segment Search ----
+SEG_COLS = ["Filename", "Start", "End", "Score"]
+
+
+def _fmt_time(seconds: float) -> str:
+    total = int(seconds)
+    return f"{total // 60}:{total % 60:02d}"
+
+
+def _seg_label(i: int, it: dict) -> str:
+    return f"{i + 1}. {it['filename']}  {_fmt_time(it['start'])}–{_fmt_time(it['end'])}  ({it['score']:.3f})"
+
+
+def api_search_segments(query: str):
+    query = (query or "").strip()
+    if not query:
+        return pd.DataFrame(columns=SEG_COLS), [], gr.update(choices=[], value=None), None
+    try:
+        r = requests.get(f"{API_URL_SERVER}/search-segments", params={"query": query, "limit": 20}, timeout=120)
+        r.raise_for_status()
+    except Exception as e:
+        raise gr.Error(f"Search failed: {e}")
+    items = []
+    for it in r.json() or []:
+        items.append(
+            {
+                "filename": it.get("filename", ""),
+                "start": float(it.get("start", 0.0)),
+                "end": float(it.get("end", 0.0)),
+                "score": float(it.get("score", 0.0)),
+            }
+        )
+    rows = [[it["filename"], _fmt_time(it["start"]), _fmt_time(it["end"]), f"{it['score']:.3f}"] for it in items]
+    df = pd.DataFrame(rows, columns=SEG_COLS)
+    choices = [_seg_label(i, it) for i, it in enumerate(items)]
+    return df, items, gr.update(choices=choices, value=None), None
+
+
+def on_seg_pick(label: str, items):
+    if not label or not items:
+        return None
+    idx = int(label.split(".", 1)[0]) - 1
+    if idx < 0 or idx >= len(items):
+        return None
+    it = items[idx]
+    try:
+        r = requests.get(
+            f"{API_URL_SERVER}/clip",
+            params={"filename": it["filename"], "start": it["start"], "end": it["end"]},
+            timeout=120,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        raise gr.Error(f"Clip failed: {e}")
+    with wave.open(io.BytesIO(r.content), "rb") as w:
+        sr = w.getframerate()
+        channels = w.getnchannels()
+        sampwidth = w.getsampwidth()
+        frames = w.readframes(w.getnframes())
+    if sampwidth != 2:
+        raise gr.Error(f"Unsupported WAV sample width: {sampwidth}")
+    audio = np.frombuffer(frames, dtype=np.int16)
+    if channels > 1:
+        audio = audio.reshape(-1, channels)
+    return (sr, audio)
+
+
+def on_seg_table_select(items, evt: gr.SelectData):
+    row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+    if not items or row is None or row >= len(items):
+        return gr.update()
+    return gr.update(value=_seg_label(row, items[row]))
+
+
+def api_rebuild_segments():
+    try:
+        r = requests.post(f"{API_URL_SERVER}/reindex-segments", timeout=3600)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
 with gr.Blocks(title="Semantic Audio Search") as demo:
     gr.Markdown("# 🔎 Semantic Audio Search")
 
@@ -166,6 +252,32 @@ with gr.Blocks(title="Semantic Audio Search") as demo:
         up_btn = gr.Button("Upload", variant="primary")
         up_out = gr.Markdown()
         up_btn.click(api_upload, inputs=[up_file, up_tags, up_desc, auto_toggle], outputs=up_out)
+
+    with gr.Tab("Segment Search"):
+        with gr.Row():
+            seg_q = gr.Textbox(label="Search query", scale=5)
+            seg_btn = gr.Button("Search", variant="primary", scale=1)
+        seg_table = gr.Dataframe(
+            headers=SEG_COLS,
+            value=[],
+            datatype=["str", "str", "str", "str"],
+            interactive=False,
+            wrap=True,
+            height=360,
+        )
+        seg_items = gr.State([])
+
+        seg_pick = gr.Dropdown(label="Pick a segment (or click a table row)", choices=[])
+        seg_audio = gr.Audio(label="Clip", type="numpy", interactive=False)
+
+        rebuild_btn = gr.Button("Rebuild segments")
+        rebuild_out = gr.JSON(label="Rebuild result")
+
+        seg_btn.click(api_search_segments, inputs=seg_q, outputs=[seg_table, seg_items, seg_pick, seg_audio])
+        seg_q.submit(api_search_segments, inputs=seg_q, outputs=[seg_table, seg_items, seg_pick, seg_audio])
+        seg_table.select(on_seg_table_select, inputs=[seg_items], outputs=seg_pick)
+        seg_pick.change(on_seg_pick, inputs=[seg_pick, seg_items], outputs=seg_audio)
+        rebuild_btn.click(api_rebuild_segments, outputs=rebuild_out)
 
 demo.launch(
     server_name=os.getenv("GRADIO_SERVER_NAME", "0.0.0.0"),
