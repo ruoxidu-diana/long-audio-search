@@ -1,0 +1,5 @@
+file,start,end,label,query
+test_long.wav,2.6,3.0,door,a door closing
+test_long.wav,8.0,15.0,footsteps,footsteps running
+test_long.wav,18.5,57.0,birds,birds chirping
+test_long.wav,61.9,73.5,dog,a dog barking
