@@ -1,6 +1,7 @@
 import os
 import uuid
 import json
+import io
 from functools import lru_cache
 from typing import List, Optional, Tuple
 
@@ -11,6 +12,7 @@ import torch
 from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
@@ -745,6 +747,44 @@ def search_segments(query: str, limit: int = 20):
             )
         )
     return out
+
+
+CLIP_PAD = 0.5
+
+
+@app.get("/clip")
+def get_clip(filename: str, start: float, end: float):
+    if (
+        not filename
+        or filename in (".", "..")
+        or "/" in filename
+        or "\\" in filename
+        or os.path.basename(filename) != filename
+    ):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    library_real = os.path.realpath(LIBRARY_DIR)
+    path = os.path.realpath(os.path.join(LIBRARY_DIR, filename))
+    if os.path.dirname(path) != library_real or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if start < 0 or end <= start:
+        raise HTTPException(status_code=400, detail="Invalid start/end")
+
+    offset = max(0.0, start - CLIP_PAD)
+    duration = (end + CLIP_PAD) - offset
+
+    sr = 48000
+    try:
+        audio, _ = librosa.load(path, sr=sr, mono=True, offset=offset, duration=duration)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Cannot read audio: {e}")
+    if len(audio) == 0:
+        raise HTTPException(status_code=400, detail="start is beyond end of file")
+
+    buf = io.BytesIO()
+    sf.write(buf, audio, sr, format="WAV")
+    return Response(content=buf.getvalue(), media_type="audio/wav")
 
 
 class UpdateReq(BaseModel):
