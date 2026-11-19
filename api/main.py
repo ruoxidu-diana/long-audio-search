@@ -155,6 +155,56 @@ def embed_audio(path: str) -> np.ndarray:
         return vec / (np.linalg.norm(vec) + 1e-10)
 
 
+# ---- 长录音片段检索：设置 ----
+SEG_COLLECTION = os.getenv("SEG_COLLECTION", "segments")
+SEG_WIN = float(os.getenv("SEG_WIN", "2.0"))
+SEG_HOP = float(os.getenv("SEG_HOP", "1.0"))
+
+
+def ensure_seg_collection(size=512):
+    collections = qd.get_collections().collections
+    if SEG_COLLECTION not in {c.name for c in collections}:
+        qd.create_collection(
+            collection_name=SEG_COLLECTION,
+            vectors_config=qmodels.VectorParams(size=size, distance=qmodels.Distance.COSINE),
+        )
+
+
+def embed_segments(path: str) -> Tuple[List[float], np.ndarray]:
+    model, proc = get_clap()
+    sr = 48000
+    audio, _ = librosa.load(path, sr=sr, mono=True)
+    audio = audio.astype(np.float32)
+
+    win = int(SEG_WIN * sr)
+    hop = int(SEG_HOP * sr)
+    n = len(audio)
+
+    starts = list(range(0, max(n - win, 0) + 1, hop))
+    if starts[-1] + win < n:
+        starts.append(starts[-1] + hop)
+
+    segments = []
+    for s in starts:
+        seg = audio[s : s + win]
+        if len(seg) < win:
+            seg = np.pad(seg, (0, win - len(seg)))
+        segments.append(seg)
+
+    all_vecs = []
+    batch_size = 32
+    with torch.no_grad():
+        for i in range(0, len(segments), batch_size):
+            batch = segments[i : i + batch_size]
+            inputs = proc(audios=batch, sampling_rate=sr, return_tensors="pt", padding=True)
+            vecs = model.get_audio_features(**inputs).cpu().numpy().astype(np.float32)
+            norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-10
+            all_vecs.append(vecs / norms)
+
+    times = [s / sr for s in starts]
+    return times, np.concatenate(all_vecs, axis=0)
+
+
 def file_fingerprint(path: str) -> Tuple[float, float]:
     st = os.stat(path)
     return float(st.st_mtime), float(st.st_size)
@@ -610,6 +660,91 @@ def reindex_incremental():
         "removed_missing": removed,
         "skipped_unchanged": skipped,
     }
+
+
+@app.post("/reindex-segments")
+def reindex_segments():
+    existing_names = {c.name for c in qd.get_collections().collections}
+    if SEG_COLLECTION in existing_names:
+        qd.delete_collection(collection_name=SEG_COLLECTION)
+    ensure_seg_collection()
+
+    with SessionLocal() as db:
+        tracks = [(t.id, t.filename, t.path) for t in db.query(Track).all()]
+
+    processed = []
+    skipped = []
+    total = 0
+    upsert_batch = 256
+
+    for track_id, filename, path in tracks:
+        try:
+            times, vecs = embed_segments(path)
+            points = [
+                qmodels.PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector=vec.tolist(),
+                    payload={
+                        "track_id": track_id,
+                        "filename": filename,
+                        "path": path,
+                        "start": float(start),
+                        "end": float(start + SEG_WIN),
+                    },
+                )
+                for start, vec in zip(times, vecs)
+            ]
+            for i in range(0, len(points), upsert_batch):
+                qd.upsert(collection_name=SEG_COLLECTION, points=points[i : i + upsert_batch])
+        except Exception as e:
+            skipped.append({"filename": filename, "error": str(e)})
+            continue
+        processed.append({"filename": filename, "segments": len(points)})
+        total += len(points)
+
+    return {
+        "processed": processed,
+        "total_segments": total,
+        "skipped": skipped,
+    }
+
+
+class SegmentResult(BaseModel):
+    filename: str
+    start: float
+    end: float
+    score: float
+    url: Optional[str] = None
+
+
+@app.get("/search-segments", response_model=List[SegmentResult])
+def search_segments(query: str, limit: int = 20):
+    existing_names = {c.name for c in qd.get_collections().collections}
+    if SEG_COLLECTION not in existing_names:
+        return []
+
+    vec = embed_text_cached(query)
+    res = qd.search(
+        collection_name=SEG_COLLECTION,
+        query_vector=vec.tolist(),
+        limit=limit,
+        with_payload=True,
+    )
+
+    out = []
+    for r in res:
+        payload = r.payload or {}
+        path = payload.get("path", "")
+        out.append(
+            SegmentResult(
+                filename=payload.get("filename", ""),
+                start=float(payload.get("start", 0.0)),
+                end=float(payload.get("end", 0.0)),
+                score=float(r.score),
+                url=public_url(path) if path else None,
+            )
+        )
+    return out
 
 
 class UpdateReq(BaseModel):
